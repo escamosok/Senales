@@ -1,1 +1,246 @@
-jjj
+%% PROYECTO PROCESADO DE SEÑALES FISIOLÓGICAS - GRABMyo
+clear; clc; close all;
+
+%% 1. RUTA BASE Y PARÁMETROS (Ajustado a tu carpeta real)
+ruta_base = 'C:\Users\escam\Downloads\github\grabmyo-1.1.0\gesture-recognition-and-biometrics-electromyogram-grabmyo-1.1.0';
+sesion = 1;                  % Sesión 1
+participantes = 1:5;         % 5 participantes diferentes (participant1 a participant5)
+gestos = [10, 17];           % Gesto 10 + Gesto 17 (Reposo, necesario para tener 2 clases al clasificar)
+trials = 1:7;                % Las 7 repeticiones de cada gesto
+fs = 2048;                   % Frecuencia de muestreo (Hz)
+
+% Índices exactos extraídos de tu archivo .hea:
+% 1:16 -> F1..F16 (Antebrazo) | 18:23 -> W1..W6 (Muñeca) | 26:31 -> W7..W12 (Muñeca)
+% (Se descartan automáticamente U1=17, U2=24, U3=25, U4=32)
+canales_validos = [1:16, 18:23, 26:31];
+
+%% 2. BUCLE DE LECTURA Y CONVERSIÓN A MILIVOLTIOS (mV)
+dataset = struct();
+contador = 1;
+
+fprintf('Iniciando lectura y conversión de datos GRABMyo...\n');
+
+for p = participantes
+    carpeta_sujeto = fullfile(ruta_base, sprintf('Session%d', sesion), sprintf('session%d_participant%d', sesion, p));
+    
+    for g = gestos
+        for t = trials
+            nombre_base = sprintf('session%d_participant%d_gesture%d_trial%d', sesion, p, g, t);
+            ruta_dat = fullfile(carpeta_sujeto, [nombre_base, '.dat']);
+            ruta_hea = fullfile(carpeta_sujeto, [nombre_base, '.hea']);
+            
+            if isfile(ruta_dat) && isfile(ruta_hea)
+                % 1) Leer calibración (ganancia y baseline) desde el .hea
+                [ganancia, baseline] = leer_calibracion_hea(ruta_hea, 32);
+                
+                % 2) Leer enteros crudos desde el .dat (32 canales x 10240 muestras)
+                fid = fopen(ruta_dat, 'r');
+                crudo = fread(fid, [32, Inf], 'int16')'; 
+                fclose(fid);
+                
+                % 3) Convertir a milivoltios reales: (crudo - baseline) / ganancia
+                senal_mV = (double(crudo) - baseline') ./ ganancia';
+                
+                % 4) Guardar en nuestra estructura solo los 28 canales EMG activos
+                dataset(contador).participante = p;
+                dataset(contador).gesto = g;
+                dataset(contador).trial = t;
+                dataset(contador).emg = senal_mV(:, canales_validos); % 10240 x 28
+                
+                contador = contador + 1;
+            else
+                warning('Falta el archivo: %s', nombre_base);
+            end
+        end
+    end
+end
+
+fprintf('¡Conversión completada! Total de registros cargados: %d (5 sujetos x %d gestos x 7 trials).\n', ...
+        length(dataset), length(gestos));
+
+%% 3. COMPROBACIÓN VISUAL DE LA SEÑAL CONVERTIDA
+tiempo = (0:size(dataset(1).emg, 1)-1) / fs;
+
+figure('Name', 'Comprobación Señal GRABMyo en mV');
+subplot(2,1,1);
+plot(tiempo, dataset(1).emg(:, 1), 'b');
+title(sprintf('Participante %d - Gesto %d (Trial 1) - Canal Antebrazo F1', dataset(1).participante, dataset(1).gesto));
+xlabel('Tiempo (s)'); ylabel('Amplitud (mV)'); grid on;
+
+subplot(2,1,2);
+plot(tiempo, dataset(8).emg(:, 1), 'r'); % Trial 1 del Gesto 17 (Reposo) del Sujeto 1
+title(sprintf('Participante %d - Gesto %d (Reposo, Trial 1) - Canal Antebrazo F1', dataset(8).participante, dataset(8).gesto));
+xlabel('Tiempo (s)'); ylabel('Amplitud (mV)'); grid on;
+
+%% 4. PREPROCESADO (Filtrado Paso Banda 20-450 Hz + Notch 60 Hz + Normalización)
+% Diseño de filtros digitales
+[b_banda, a_banda] = butter(4, [20 450] / (fs/2), 'bandpass');
+[b_notch, a_notch] = iirnotch(60 / (fs/2), (60 / (fs/2)) / 35); % Red eléctrica GRABMyo (60 Hz)
+
+for i = 1:length(dataset)
+    emg_cruda = dataset(i).emg;
+    
+    % 1) Filtrado paso banda y notch con fase cero (filtfilt)
+    emg_filt = filtfilt(b_banda, a_banda, emg_cruda);
+    emg_filt = filtfilt(b_notch, a_notch, emg_filt);
+    
+    % 2) Normalización Z-score por canal (media 0, desviación estándar 1)
+    emg_norm = (emg_filt - mean(emg_filt, 1)) ./ std(emg_filt, 0, 1);
+    
+    dataset(i).emg_proc = emg_norm;
+end
+
+% Comprobación visual: Señal cruda vs. Señal preprocesada (Canal F1, Registro 1)
+figure('Name', 'Efecto del Preprocesado en sEMG');
+subplot(2,1,1);
+plot(tiempo, dataset(1).emg(:, 1), 'Color', [0.5 0.5 0.5]);
+title('Señal sEMG Original (mV)');
+xlabel('Tiempo (s)'); ylabel('Amplitud (mV)'); grid on;
+
+subplot(2,1,2);
+plot(tiempo, dataset(1).emg_proc(:, 1), 'b');
+title('Señal sEMG Filtrada (20-450 Hz + Notch 60 Hz) y Normalizada (Z-score)');
+xlabel('Tiempo (s)'); ylabel('Amplitud norm.'); grid on;
+
+%% 5. SEGMENTACIÓN EN VENTANAS DESLIZANTES
+tam_ventana = round(0.250 * fs);   % 250 ms -> 512 muestras
+paso_ventana = round(0.125 * fs);  % Solapamiento 50% -> avance de 256 muestras
+
+ventanas = {};
+etiquetas_gesto = [];
+etiquetas_sujeto = [];
+
+idx_v = 1;
+for i = 1:length(dataset)
+    senal = dataset(i).emg_proc;
+    num_muestras = size(senal, 1);
+    
+    for inicio = 1 : paso_ventana : (num_muestras - tam_ventana + 1)
+        fin = inicio + tam_ventana - 1;
+        
+        ventanas{idx_v} = senal(inicio:fin, :); % Matriz de 512 x 28
+        etiquetas_gesto(idx_v, 1) = dataset(i).gesto;
+        etiquetas_sujeto(idx_v, 1) = dataset(i).participante;
+        idx_v = idx_v + 1;
+    end
+end
+
+fprintf('Segmentación completada: %d ventanas de 250 ms generadas.\n', length(ventanas));
+
+%% 6. EXTRACCIÓN DE CARACTERÍSTICAS (Lineales + No Lineales)
+num_ventanas = length(ventanas);
+num_canales = size(ventanas{1}, 2); % 28 canales
+
+X_lineal = zeros(num_ventanas, num_canales * 4);   % MAV, RMS, WL, Curtosis
+X_nolineal = zeros(num_ventanas, num_canales * 2); % Entropía Permutación, DFA/Fluctuación
+
+fprintf('Extrayendo características lineales y no lineales de %d ventanas...\n', num_ventanas);
+
+for v = 1:num_ventanas
+    seg = ventanas{v}; % 512 x 28
+    
+    % --- A. Características Lineales y Estadísticas (por canal) ---
+    mav = mean(abs(seg), 1);
+    rms_val = sqrt(mean(seg.^2, 1));
+    wl = sum(abs(diff(seg, 1, 1)), 1);
+    kurt = kurtosis(seg, 1, 1); % Estadístico de orden superior
+    
+    X_lineal(v, :) = [mav, rms_val, wl, kurt];
+    
+    % --- B. Características No Lineales (por canal) ---
+    perm_ent = zeros(1, num_canales);
+    dfa_val = zeros(1, num_canales);
+    
+    for c = 1:num_canales
+        perm_ent(c) = calcular_entropia_permutacion(seg(:, c), 3, 1);
+        dfa_val(c) = calcular_dfa_rapido(seg(:, c));
+    end
+    
+    X_nolineal(v, :) = [perm_ent, dfa_val];
+end
+
+% Matriz completa combinada (Lineal + No Lineal)
+X_total = [X_lineal, X_nolineal];
+Y = etiquetas_gesto;
+
+fprintf('Matriz de características lista: %d muestras x %d características.\n', size(X_total, 1), size(X_total, 2));
+
+
+%% 7. PREPARAR TABLA PARA LA APP "CLASSIFICATION LEARNER"
+% Crear nombres descriptivos para las 168 columnas (4 lineales + 2 no lineales por canal)
+tipos_feat = {'MAV', 'RMS', 'WL', 'Kurt', 'PermEnt', 'DFA'};
+nombres_cols = {};
+
+for t = 1:length(tipos_feat)
+    for c = 1:num_canales
+        nombres_cols{end+1} = sprintf('%s_Ch%d', tipos_feat{t}, c);
+    end
+end
+
+% Convertir la matriz de características en una tabla de MATLAB
+tabla_datos = array2table(X_total, 'VariableNames', nombres_cols);
+
+% Añadir la columna objetivo (clase) como variable categórica
+tabla_datos.Gesto = categorical(etiquetas_gesto);
+
+% (Opcional) Crear también una tabla SOLO con características lineales para comparar
+tabla_solo_lineal = array2table(X_lineal, 'VariableNames', nombres_cols(1 : num_canales*4));
+tabla_solo_lineal.Gesto = categorical(etiquetas_gesto);
+
+fprintf('¡Listo! Variables "tabla_datos" y "tabla_solo_lineal" creadas en el Workspace.\n');
+
+
+%% --- FUNCIÓN AUXILIAR PARA LEER GANANCIA Y BASELINE DEL .HEA ---
+function [ganancia, baseline] = leer_calibracion_hea(ruta_hea, num_canales)
+    ganancia = ones(num_canales, 1);
+    baseline = zeros(num_canales, 1);
+    
+    fid = fopen(ruta_hea, 'r');
+    fgetl(fid); % Saltar la primera línea de cabecera general
+    for c = 1:num_canales
+        linea = fgetl(fid);
+        % Extraer los números en el patrón: ganancia(baseline)/mV
+        tokens = regexp(linea, '([\d\.]+)\(([-\d]+)\)/mV', 'tokens');
+        if ~isempty(tokens)
+            ganancia(c) = str2double(tokens{1}{1});
+            baseline(c) = str2double(tokens{1}{2});
+        end
+    end
+    fclose(fid);
+end
+
+function pe = calcular_entropia_permutacion(x, m, tau)
+    % Entropía de permutación normalizada (orden m, retardo tau)
+    N = length(x);
+    num_patrones = N - (m - 1)*tau;
+    idx = (1:num_patrones)' + (0:m-1)*tau;
+    subsecuencias = x(idx);
+    [~, orden] = sort(subsecuencias, 2);
+    [~, ~, ic] = unique(orden, 'rows');
+    conteos = accumarray(ic, 1);
+    prob = conteos / sum(conteos);
+    pe = -sum(prob .* log2(prob)) / log2(factorial(m));
+end
+
+function alpha = calcular_dfa_rapido(x)
+    % Análisis de Fluctuaciones sin Tendencia (DFA) simplificado
+    y = cumsum(x - mean(x));
+    N = length(y);
+    escalas = [8, 16, 32, 64, 128];
+    F = zeros(size(escalas));
+    for k = 1:length(escalas)
+        s = escalas(k);
+        num_bloques = floor(N / s);
+        rms_bloque = zeros(1, num_bloques);
+        t = (1:s)';
+        for b = 1:num_bloques
+            tramo = y((b-1)*s + 1 : b*s);
+            p = polyfit(t, tramo, 1);
+            tendencia = polyval(p, t);
+            rms_bloque(b) = sqrt(mean((tramo - tendencia).^2));
+        end
+        F(k) = mean(rms_bloque);
+    end
+    coef = polyfit(log10(escalas), log10(F), 1);
+    alpha = coef(1);
+end
